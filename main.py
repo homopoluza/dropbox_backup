@@ -147,9 +147,17 @@ if __name__ == "__main__":
     # Script settings
     root_dir = os.getenv('ROOT_DIR')
     site = os.getenv('DROPBOX_FOLDER')
-    database = os.getenv('DB_DATABASE')
     days = int(os.getenv('DAYS')) # delete Dropbox files older than days
     bitrix_framework = os.getenv('BITRIX') =='True' # for bitrix CMS
+
+    # Get DB settings
+    db_type = os.getenv('DB_TYPE')
+    db_host = os.getenv('DB_HOST', 'localhost')
+    db_port = os.getenv('DB_PORT')
+    db_user = os.getenv('DB_USER')
+    db_password = os.getenv('DB_PASSWORD')
+    database = os.getenv('DB_DATABASE')
+
     
     #Dropbox app key, secret, and refresh token
     CHUNK_SIZE = 8 * 1024 * 1024 # 8MB
@@ -170,8 +178,20 @@ if __name__ == "__main__":
         database_dump_name = database + '_' + datetime.now().strftime("%Y%m%d_%H%M%S") + '.sql'
         archive_path = shutil.make_archive(archive_name, 'tar', root_dir)
         archive_name = os.path.basename(archive_path)
-        command = f"mysqldump --defaults-file=$PWD/.my.cnf {database} > {database_dump_name}"
-        subprocess.run(command, shell=True)
+        if db_type == 'mysql':
+            env = os.environ.copy()
+            env['MYSQL_PWD'] = db_password
+            command = f"mysqldump -h {db_host} -P {db_port} -u {db_user} {database}"
+            with open(database_dump_name, 'wb') as f:
+                subprocess.run(command, shell=True, stdout=f, env=env)
+        elif db_type == 'postgres':
+            env = os.environ.copy()
+            env['PGPASSWORD'] = db_password
+            command = f"pg_dump -h {db_host} -p {db_port} -U {db_user} {database}"
+            with open(database_dump_name, 'w') as f:
+                subprocess.run(command, shell=True, stdout=f, env=env)
+        else:
+            raise ValueError(f"Unknown DB_TYPE: {db_type}")
         archive_size = os.path.getsize(f"./{archive_name}")
         database_dump_size = os.path.getsize(f"./{database_dump_name}")
         archive_uploaded = uploader.upload_file(archive_name, archive_size)
