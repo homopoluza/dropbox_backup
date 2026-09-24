@@ -1,5 +1,6 @@
 import concurrent.futures
 import os
+import re
 import shutil
 import smtplib
 import subprocess
@@ -11,6 +12,9 @@ from functools import partial
 import dropbox
 from dotenv import load_dotenv
 from dropbox.exceptions import ApiError
+
+# Bitrix splits a backup into <name>.tar.gz plus <name>.tar.gz.1 .. .tar.gz.N parts
+BACKUP_ARCHIVE_RE = re.compile(r'\.tar\.gz(\.\d+)?$')
 
 
 class DropboxUploader:
@@ -71,24 +75,33 @@ class DropboxUploader:
                 time.sleep(2 ** retries)
 
     def upload_folder(self, folder_path, bitrix=True, max_workers=10):
-        started = time.time()
         try:
+            folder_exists = self.check_folder_exists()
+
+            remote_names = set()
+            if folder_exists:
+                result = self.dbx.files_list_folder(self.path)
+                remote_names.update(entry.name for entry in result.entries)
+                while result.has_more:
+                    result = self.dbx.files_list_folder_continue(result.cursor)
+                    remote_names.update(entry.name for entry in result.entries)
+
             file_list = []
             for root, dirs, files in os.walk(folder_path):
                 for filename in files:
-                    if not filename.endswith('.tar.gz'):
+                    if not BACKUP_ARCHIVE_RE.search(filename):
+                        continue
+                    if filename in remote_names:
+                        # Already on Dropbox -> identical content would not be written anyway
                         continue
                     file_path = os.path.join(root, filename)
-                    if os.path.getmtime(file_path) <= started:
-                        # Stale leftover from a previous run -> not tonight's backup
-                        continue
                     file_list.append((file_path, os.path.getsize(file_path)))
 
             if not file_list:
-                # No fresh archives (backup failed) -> leave Dropbox untouched
+                # No new archives (backup failed) -> leave Dropbox untouched
                 return False
 
-            if bitrix and not self.check_folder_exists():
+            if bitrix and not folder_exists:
                 self.create_folder()
 
             upload_func = partial(self.upload_file, bitrix=bitrix)
