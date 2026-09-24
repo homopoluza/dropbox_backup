@@ -1,15 +1,17 @@
-import subprocess
-import os
-import dropbox
-from dropbox.exceptions import ApiError
-import shutil
-import time
-from datetime import datetime, timedelta
-import smtplib
-from email.mime.text import MIMEText
 import concurrent.futures
+import os
+import shutil
+import smtplib
+import subprocess
+import time
+from datetime import datetime, timedelta, timezone
+from email.mime.text import MIMEText
 from functools import partial
+
+import dropbox
 from dotenv import load_dotenv
+from dropbox.exceptions import ApiError
+
 
 class DropboxUploader:
     def __init__(self, CHUNK_SIZE, path, days, app_key, app_secret, refresh_token):
@@ -43,7 +45,7 @@ class DropboxUploader:
         relative_path = os.path.basename(file_name)
         while retries < max_retries:
             try:
-                if not self.check_folder_exists and not bitrix:
+                if not bitrix and not self.check_folder_exists():
                     self.create_folder()
             
                 with open(file_name, 'rb') as f:
@@ -66,25 +68,35 @@ class DropboxUploader:
                 if retries == max_retries:
                     self.send_email(site, api_err)
                     return False
+                time.sleep(2 ** retries)
 
     def upload_folder(self, folder_path, bitrix=True, max_workers=10):
+        started = time.time()
         try:
-            if bitrix and not self.check_folder_exists():
-                self.create_folder()
-            
             file_list = []
             for root, dirs, files in os.walk(folder_path):
                 for filename in files:
+                    if not filename.endswith('.tar.gz'):
+                        continue
                     file_path = os.path.join(root, filename)
-                    file_size = os.path.getsize(file_path)
-                    file_list.append((file_path, file_size))
-            
+                    if os.path.getmtime(file_path) <= started:
+                        # Stale leftover from a previous run -> not tonight's backup
+                        continue
+                    file_list.append((file_path, os.path.getsize(file_path)))
+
+            if not file_list:
+                # No fresh archives (backup failed) -> leave Dropbox untouched
+                return False
+
+            if bitrix and not self.check_folder_exists():
+                self.create_folder()
+
             upload_func = partial(self.upload_file, bitrix=bitrix)
-            
+
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                executor.map(lambda x: upload_func(*x), file_list)
-            
-            return True
+                results = list(executor.map(lambda x: upload_func(*x), file_list))
+
+            return all(results)
         except Exception as err:
             self.send_email(site, err)
             return False
@@ -114,18 +126,24 @@ class DropboxUploader:
             result = self.dbx.files_list_folder(self.path)
             files.extend(result.entries)  
 
-            # Handle pagination 
-            while result.has_more: 
-                result = self.dbx.files_list_folder_continue(result.cursor) 
-                files.extend(result.entries)            
+            now = datetime.now(timezone.utc)
 
-            # now = datetime.now(timezone.utc)
-            now = datetime.now()
+            # Never delete the most recent backup, even if it's older than `days`
+            file_entries = [f for f in files if isinstance(f, dropbox.files.FileMetadata)]
+            newest_id = max(file_entries, key=lambda f: f.client_modified).id if file_entries else None
 
             def delete_if_old(file):
                 try:
-                    # Dropbox uses UTC time for file metadata
-                    file_time = file.client_modified
+                    # Skip folders; only age out file backups
+                    if isinstance(file, dropbox.files.FolderMetadata):
+                        return
+
+                    # Keep the newest file as a safety net
+                    if newest_id is not None and file.id == newest_id:
+                        return
+
+                    # Dropbox reports client_modified as naive UTC
+                    file_time = file.client_modified.replace(tzinfo=timezone.utc)
 
                     # Check if the file is older than `days` days
                     if now - file_time > timedelta(days=self.days):
@@ -135,7 +153,7 @@ class DropboxUploader:
                     self.send_email(site, err)
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                executor.map(delete_if_old, files)
+                list(executor.map(delete_if_old, files))
 
         except Exception as err:
             self.send_email(site, err)
